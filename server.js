@@ -18,7 +18,8 @@ const ALLOWED_UNIVERSES = [
     "9978804792",
     "10046314551",
     "10214313758",
-    "10226076955"
+    "10226076955",
+    "10177837288"
 ];
 
 function createDonationHash(donorName, amount, message) {
