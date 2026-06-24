@@ -4,14 +4,14 @@ const Redis = require("ioredis");
 const crypto = require("crypto");
 
 const app = express();
+
 app.use(bodyParser.json({ limit: "1mb" }));
 
-if (!process.env.REDIS_URL) {
-    console.warn("[WARN] REDIS_URL belum diset di Vercel Environment Variables");
-}
+// ============================================================
+// ENV
+// ============================================================
 
-const redis = new Redis(process.env.REDIS_URL);
-
+const REDIS_URL = process.env.REDIS_URL || "";
 const ALLOWED_UNIVERSES = (process.env.ALLOWED_UNIVERSES || "")
     .split(",")
     .map(v => v.trim())
@@ -19,6 +19,26 @@ const ALLOWED_UNIVERSES = (process.env.ALLOWED_UNIVERSES || "")
 
 const ROBLOX_TOPIC = process.env.ROBLOX_TOPIC || "DonationV1";
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
+
+let redis = null;
+
+if (REDIS_URL) {
+    redis = new Redis(REDIS_URL, {
+        maxRetriesPerRequest: 1,
+        enableReadyCheck: false,
+        lazyConnect: false,
+    });
+
+    redis.on("error", (err) => {
+        console.warn("[REDIS ERROR]", err?.message || err);
+    });
+} else {
+    console.warn("[WARN] REDIS_URL belum diset. Redis history/dedupe akan dilewati.");
+}
+
+// ============================================================
+// BASIC HELPERS
+// ============================================================
 
 function isAllowedUniverse(universeId) {
     return ALLOWED_UNIVERSES.includes(String(universeId));
@@ -29,6 +49,8 @@ function getRobloxApiKey(universeId) {
 }
 
 function verifyWebhookSecret(req) {
+    // Kalau WEBHOOK_SECRET kosong, secret check dimatikan.
+    // Untuk production sebaiknya tetap isi WEBHOOK_SECRET di Vercel.
     if (!WEBHOOK_SECRET) return true;
 
     const fromQuery = req.query.secret;
@@ -37,23 +59,59 @@ function verifyWebhookSecret(req) {
     return fromQuery === WEBHOOK_SECRET || fromHeader === WEBHOOK_SECRET;
 }
 
-function createDonationHash(donorName, amount, message) {
+function parseAmount(val) {
+    if (!val) return 0;
+    return Number(String(val).replace(/[^\d]/g, ""));
+}
+
+function createDonationHash(source, donorName, amount, message, providerId) {
+    if (providerId) {
+        return crypto
+            .createHash("sha256")
+            .update(`${source}:${providerId}`)
+            .digest("hex");
+    }
+
+    // Bucket 5 detik untuk mencegah duplicate webhook double-send.
     const timeBucket = Math.floor(Date.now() / 5000);
 
     return crypto
-        .createHash("md5")
+        .createHash("sha256")
         .update(
-            String(donorName) +
-            String(amount) +
-            String(message || "") +
-            String(timeBucket)
+            `${source}:${String(donorName)}:${String(amount)}:${String(message || "")}:${String(timeBucket)}`
         )
         .digest("hex");
 }
 
-function parseAmount(val) {
-    if (!val) return 0;
-    return Number(String(val).replace(/[^\d]/g, ""));
+function validateWebhookBase(req, res) {
+    const universeId = String(req.params.universeId || "");
+
+    if (!universeId) {
+        res.status(400).json({
+            ok: false,
+            error: "MISSING_UNIVERSE_ID",
+        });
+        return null;
+    }
+
+    if (!isAllowedUniverse(universeId)) {
+        res.status(403).json({
+            ok: false,
+            error: "UNAUTHORIZED_UNIVERSE",
+            universeId,
+        });
+        return null;
+    }
+
+    if (!verifyWebhookSecret(req)) {
+        res.status(401).json({
+            ok: false,
+            error: "INVALID_WEBHOOK_SECRET",
+        });
+        return null;
+    }
+
+    return universeId;
 }
 
 function compactDonation(donation) {
@@ -71,6 +129,10 @@ function compactDonation(donation) {
     };
 }
 
+// ============================================================
+// ROBLOX OPEN CLOUD PUSH
+// ============================================================
+
 async function publishDonationToRoblox(universeId, donation) {
     const apiKey = getRobloxApiKey(universeId);
 
@@ -85,6 +147,7 @@ async function publishDonationToRoblox(universeId, donation) {
     let payload = compactDonation(donation);
     let message = JSON.stringify(payload);
 
+    // MessagingService payload kecil, jadi dipotong aman.
     if (Buffer.byteLength(message, "utf8") > 950) {
         payload.donation.message = String(payload.donation.message || "").slice(0, 80);
         message = JSON.stringify(payload);
@@ -92,186 +155,171 @@ async function publishDonationToRoblox(universeId, donation) {
 
     const url = `https://apis.roblox.com/cloud/v2/universes/${universeId}:publishMessage`;
 
-    const response = await fetch(url, {
-        method: "POST",
-        headers: {
-            "x-api-key": apiKey,
-            "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-            topic: ROBLOX_TOPIC,
-            message,
-        }),
-    });
+    try {
+        const response = await fetch(url, {
+            method: "POST",
+            headers: {
+                "x-api-key": apiKey,
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+                topic: ROBLOX_TOPIC,
+                message,
+            }),
+        });
 
-    if (!response.ok) {
-        const text = await response.text().catch(() => "");
-        console.error("[ROBLOX PUBLISH FAILED]", response.status, text);
+        if (!response.ok) {
+            const text = await response.text().catch(() => "");
+            console.error("[ROBLOX PUBLISH FAILED]", response.status, text);
+
+            return {
+                ok: false,
+                status: response.status,
+                body: text,
+            };
+        }
+
+        return {
+            ok: true,
+        };
+    } catch (err) {
+        console.error("[ROBLOX PUBLISH ERROR]", err?.message || err);
 
         return {
             ok: false,
-            status: response.status,
-            body: text,
+            reason: "ROBLOX_PUBLISH_ERROR",
+            message: err?.message || String(err),
+        };
+    }
+}
+
+// ============================================================
+// REDIS BEST-EFFORT
+// Redis tidak wajib. Kalau Upstash limit/error, donation tetap push.
+// ============================================================
+
+async function markDuplicateBestEffort(hash) {
+    if (!redis) {
+        return {
+            checked: false,
+            duplicate: false,
+            reason: "REDIS_DISABLED",
         };
     }
 
-    return {
-        ok: true,
-    };
+    try {
+        const inserted = await redis.set(
+            `donationHash:${hash}`,
+            "1",
+            "EX",
+            300,
+            "NX"
+        );
+
+        if (!inserted) {
+            return {
+                checked: true,
+                duplicate: true,
+            };
+        }
+
+        return {
+            checked: true,
+            duplicate: false,
+        };
+    } catch (err) {
+        console.warn("[REDIS DEDUPE SKIPPED]", err?.message || err);
+
+        return {
+            checked: false,
+            duplicate: false,
+            reason: "REDIS_ERROR",
+        };
+    }
+}
+
+async function saveDonationBestEffort(universeId, donation) {
+    if (!redis) {
+        return {
+            ok: false,
+            reason: "REDIS_DISABLED",
+        };
+    }
+
+    try {
+        await redis.zadd(
+            `donations:${universeId}`,
+            donation.timestamp,
+            JSON.stringify(donation)
+        );
+
+        await redis.set(
+            `lastDonationId:${universeId}`,
+            String(donation.timestamp)
+        );
+
+        return {
+            ok: true,
+        };
+    } catch (err) {
+        console.warn("[REDIS SAVE SKIPPED]", err?.message || err);
+
+        return {
+            ok: false,
+            reason: "REDIS_ERROR",
+            message: err?.message || String(err),
+        };
+    }
 }
 
 async function saveAndPublishDonation(universeId, donation) {
-    await redis.zadd(
-        `donations:${universeId}`,
-        donation.timestamp,
-        JSON.stringify(donation)
-    );
+    // PENTING:
+    // Push ke Roblox dulu. Jadi kalau Redis/Upstash limit, donation tetap masuk realtime.
+    const publishResult = await publishDonationToRoblox(universeId, donation);
 
-    await redis.set(
-        `lastDonationId:${universeId}`,
-        String(donation.timestamp)
-    );
+    // Redis hanya untuk history/dedupe/fallback. Tidak boleh menggagalkan donation.
+    const saveResult = await saveDonationBestEffort(universeId, donation);
 
-    return await publishDonationToRoblox(universeId, donation);
+    return {
+        publishResult,
+        saveResult,
+    };
 }
 
-function validateWebhookBase(req, res) {
-    const universeId = String(req.params.universeId || "");
+// ============================================================
+// LEGACY SESSION/POLLING DISABLED
+// Tidak ada session Redis lagi.
+// ============================================================
 
-    if (!universeId) {
-        res.status(400).json({
-            error: "MISSING_UNIVERSE_ID",
-        });
-        return null;
-    }
-
-    if (!isAllowedUniverse(universeId)) {
-        res.status(403).json({
-            error: "UNAUTHORIZED_UNIVERSE",
-            universeId,
-        });
-        return null;
-    }
-
-    if (!verifyWebhookSecret(req)) {
-        res.status(401).json({
-            error: "INVALID_WEBHOOK_SECRET",
-        });
-        return null;
-    }
-
-    return universeId;
-}
-
-// ================================
-// LEGACY SESSION / POLLING ENDPOINTS
-// Ini tetap disimpan untuk fallback.
-// Tapi nanti polling Roblox lama harus dimatikan.
-// ================================
-
-app.post("/api/session", async (req, res) => {
-    try {
-        const universeId = String(req.body.universeId || "");
-
-        if (!isAllowedUniverse(universeId)) {
-            return res.json({
-                ok: false,
-                reason: "UNAUTHORIZED_UNIVERSE",
-            });
-        }
-
-        const token = crypto.randomUUID();
-
-        await redis.set(
-            `session:${token}`,
-            universeId,
-            "EX",
-            86400
-        );
-
-        res.json({
-            ok: true,
-            token,
-        });
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({
-            ok: false,
-            error: "INTERNAL_ERROR",
-        });
-    }
+app.post("/api/session", (req, res) => {
+    res.status(410).json({
+        ok: false,
+        reason: "LEGACY_SESSION_DISABLED",
+        message: "Donation bridge now uses OpenCloudPush only. Roblox server must not call /api/session.",
+    });
 });
 
-async function validateSession(req) {
-    const token = req.headers["x-session"];
-    if (!token) return null;
-
-    return await redis.get(`session:${token}`);
-}
-
-app.get("/api/tail", async (req, res) => {
-    try {
-        const universeId = await validateSession(req);
-
-        if (!universeId) {
-            return res.json({
-                ok: false,
-                reason: "INVALID_SESSION",
-            });
-        }
-
-        const lastId = await redis.get(`lastDonationId:${universeId}`);
-
-        res.json({
-            id: lastId || "0",
-        });
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({
-            ok: false,
-            error: "INTERNAL_ERROR",
-        });
-    }
+app.get("/api/tail", (req, res) => {
+    res.status(410).json({
+        ok: false,
+        reason: "LEGACY_POLLING_DISABLED",
+        message: "Donation bridge now uses OpenCloudPush only. Roblox server must not call /api/tail.",
+    });
 });
 
-app.get("/api/donations", async (req, res) => {
-    try {
-        const universeId = await validateSession(req);
-
-        if (!universeId) {
-            return res.json({
-                ok: false,
-                reason: "INVALID_SESSION",
-            });
-        }
-
-        const after = req.query.after || "0";
-
-        const items = await redis.zrangebyscore(
-            `donations:${universeId}`,
-            `(${after}`,
-            "+inf"
-        );
-
-        const parsed = items.map(item => JSON.parse(item));
-
-        res.json({
-            items: parsed,
-        });
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({
-            ok: false,
-            error: "INTERNAL_ERROR",
-        });
-    }
+app.get("/api/donations", (req, res) => {
+    res.status(410).json({
+        ok: false,
+        reason: "LEGACY_POLLING_DISABLED",
+        message: "Donation bridge now uses OpenCloudPush only. Roblox server must not call /api/donations.",
+    });
 });
 
-// ================================
+// ============================================================
 // WEBHOOK SAWERIA
 // URL:
-// /webhook/saweria/:universeId?secret=WEBHOOK_SECRET
-// ================================
+// POST /webhook/saweria/:universeId?secret=WEBHOOK_SECRET
+// ============================================================
 
 app.post("/webhook/saweria/:universeId", async (req, res) => {
     try {
@@ -284,6 +332,7 @@ app.post("/webhook/saweria/:universeId", async (req, res) => {
             return res.json({
                 ok: true,
                 ignored: true,
+                reason: "NOT_DONATION_EVENT",
             });
         }
 
@@ -307,17 +356,30 @@ app.post("/webhook/saweria/:universeId", async (req, res) => {
             "Anonymous";
 
         const message = String(raw.message || "");
-        const hash = createDonationHash(donorName, amount, message);
 
-        const exists = await redis.get(`donationHash:${hash}`);
-        if (exists) {
+        const providerId =
+            raw.id ||
+            raw.transaction_id ||
+            raw.invoice_id ||
+            raw.payment_id ||
+            "";
+
+        const hash = createDonationHash(
+            "saweria",
+            donorName,
+            amount,
+            message,
+            providerId
+        );
+
+        const dedupe = await markDuplicateBestEffort(hash);
+
+        if (dedupe.duplicate) {
             return res.json({
                 ok: true,
                 duplicate: true,
             });
         }
-
-        await redis.set(`donationHash:${hash}`, "1", "EX", 300);
 
         const timestamp = Date.now();
 
@@ -331,26 +393,31 @@ app.post("/webhook/saweria/:universeId", async (req, res) => {
             message,
         };
 
-        const publishResult = await saveAndPublishDonation(universeId, donation);
+        const result = await saveAndPublishDonation(universeId, donation);
 
         res.json({
             ok: true,
-            pushedToRoblox: publishResult.ok === true,
-            publishResult,
+            donationId: donation.id,
+            pushedToRoblox: result.publishResult.ok === true,
+            publishResult: result.publishResult,
+            savedToRedis: result.saveResult.ok === true,
+            saveResult: result.saveResult,
+            dedupe,
         });
     } catch (err) {
-        console.error(err);
+        console.error("[WEBHOOK SAWERIA ERROR]", err);
         res.status(500).json({
+            ok: false,
             error: "INTERNAL_ERROR",
         });
     }
 });
 
-// ================================
+// ============================================================
 // WEBHOOK BAGIBAGI
 // URL:
-// /webhook/bagibagi/:universeId?secret=WEBHOOK_SECRET
-// ================================
+// POST /webhook/bagibagi/:universeId?secret=WEBHOOK_SECRET
+// ============================================================
 
 app.post("/webhook/bagibagi/:universeId", async (req, res) => {
     try {
@@ -376,6 +443,7 @@ app.post("/webhook/bagibagi/:universeId", async (req, res) => {
             raw.name ||
             raw.username ||
             raw.donator ||
+            raw.donator_name ||
             "Anonymous";
 
         const message =
@@ -384,17 +452,29 @@ app.post("/webhook/bagibagi/:universeId", async (req, res) => {
             raw.pesan ||
             "";
 
-        const hash = createDonationHash(donorName, amount, message);
+        const providerId =
+            raw.id ||
+            raw.transaction_id ||
+            raw.order_id ||
+            raw.invoice_id ||
+            "";
 
-        const exists = await redis.get(`donationHash:${hash}`);
-        if (exists) {
+        const hash = createDonationHash(
+            "bagibagi",
+            donorName,
+            amount,
+            message,
+            providerId
+        );
+
+        const dedupe = await markDuplicateBestEffort(hash);
+
+        if (dedupe.duplicate) {
             return res.json({
                 ok: true,
                 duplicate: true,
             });
         }
-
-        await redis.set(`donationHash:${hash}`, "1", "EX", 300);
 
         const timestamp = Date.now();
 
@@ -408,27 +488,31 @@ app.post("/webhook/bagibagi/:universeId", async (req, res) => {
             message: String(message),
         };
 
-        const publishResult = await saveAndPublishDonation(universeId, donation);
+        const result = await saveAndPublishDonation(universeId, donation);
 
         res.json({
             ok: true,
-            pushedToRoblox: publishResult.ok === true,
-            publishResult,
+            donationId: donation.id,
+            pushedToRoblox: result.publishResult.ok === true,
+            publishResult: result.publishResult,
+            savedToRedis: result.saveResult.ok === true,
+            saveResult: result.saveResult,
+            dedupe,
         });
     } catch (err) {
-        console.error(err);
+        console.error("[WEBHOOK BAGIBAGI ERROR]", err);
         res.status(500).json({
+            ok: false,
             error: "INTERNAL_ERROR",
         });
     }
 });
 
-// ================================
+// ============================================================
 // TEST OPEN CLOUD PUBLISH
-// Pakai ini untuk test tanpa provider donation.
 // URL:
-// /api/test/publish/:universeId?secret=WEBHOOK_SECRET
-// ================================
+// POST /api/test/publish/:universeId?secret=WEBHOOK_SECRET
+// ============================================================
 
 app.post("/api/test/publish/:universeId", async (req, res) => {
     try {
@@ -447,29 +531,48 @@ app.post("/api/test/publish/:universeId", async (req, res) => {
             message: String(req.body?.message || "Test Open Cloud donation"),
         };
 
-        const publishResult = await saveAndPublishDonation(universeId, donation);
+        const result = await saveAndPublishDonation(universeId, donation);
 
         res.json({
             ok: true,
             donation,
-            pushedToRoblox: publishResult.ok === true,
-            publishResult,
+            pushedToRoblox: result.publishResult.ok === true,
+            publishResult: result.publishResult,
+            savedToRedis: result.saveResult.ok === true,
+            saveResult: result.saveResult,
         });
     } catch (err) {
-        console.error(err);
+        console.error("[TEST PUBLISH ERROR]", err);
         res.status(500).json({
+            ok: false,
             error: "INTERNAL_ERROR",
         });
     }
 });
 
+// ============================================================
+// HEALTH CHECK
+// ============================================================
+
 app.get("/", (req, res) => {
     res.json({
         ok: true,
         service: "roblox-donation-bridge",
+        mode: "OpenCloudPush",
+        legacySession: false,
+        legacyPolling: false,
         topic: ROBLOX_TOPIC,
         allowedUniverses: ALLOWED_UNIVERSES,
+        redisEnabled: Boolean(redis),
     });
+});
+
+app.get("/favicon.ico", (req, res) => {
+    res.status(204).end();
+});
+
+app.get("/favicon.png", (req, res) => {
+    res.status(204).end();
 });
 
 module.exports = app;
