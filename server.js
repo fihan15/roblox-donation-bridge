@@ -6,6 +6,7 @@ const crypto = require("crypto");
 const app = express();
 
 app.use(bodyParser.json({ limit: "1mb" }));
+app.use(bodyParser.urlencoded({ extended: true, limit: "1mb" }));
 
 // ============================================================
 // ENV
@@ -19,6 +20,7 @@ const ALLOWED_UNIVERSES = (process.env.ALLOWED_UNIVERSES || "")
 
 const ROBLOX_TOPIC = process.env.ROBLOX_TOPIC || "DonationV1";
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
+const WEBHOOK_DEBUG = process.env.WEBHOOK_DEBUG === "true";
 
 let redis = null;
 
@@ -62,6 +64,45 @@ function verifyWebhookSecret(req) {
 function parseAmount(val) {
     if (!val) return 0;
     return Number(String(val).replace(/[^\d]/g, ""));
+}
+
+function getPayloadViews(raw) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
+
+    // Provider webhook kadang mengirim field langsung, kadang dibungkus.
+    return [
+        raw,
+        raw.data,
+        raw.donation,
+        raw.transaction,
+        raw.payload,
+        raw.result,
+    ].filter(value => value && typeof value === "object" && !Array.isArray(value));
+}
+
+function firstWebhookValue(raw, fieldNames) {
+    for (const view of getPayloadViews(raw)) {
+        for (const fieldName of fieldNames) {
+            const value = view[fieldName];
+
+            if (value !== undefined && value !== null && value !== "") {
+                return value;
+            }
+        }
+    }
+
+    return "";
+}
+
+function listWebhookFields(raw) {
+    const fields = [];
+
+    for (const [containerIndex, view] of getPayloadViews(raw).entries()) {
+        const prefix = containerIndex === 0 ? "root" : `nested${containerIndex}`;
+        fields.push(...Object.keys(view).slice(0, 40).map(key => `${prefix}.${key}`));
+    }
+
+    return [...new Set(fields)].slice(0, 100);
 }
 
 function createDonationHash(source, donorName, amount, message, providerId) {
@@ -509,6 +550,130 @@ app.post("/webhook/bagibagi/:universeId", async (req, res) => {
 });
 
 // ============================================================
+// WEBHOOK SOCIABUZZ
+// URL:
+// POST /webhook/sociabuzz/:universeId?secret=WEBHOOK_SECRET
+//
+// Sociabuzz dapat mengirim application/json atau form-urlencoded.
+// Field dibuat toleran terhadap payload langsung maupun nested karena format
+// integrasi dapat berbeda antar-produk/versi (TRIBE, support, transaction).
+// ============================================================
+
+app.post("/webhook/sociabuzz/:universeId", async (req, res) => {
+    try {
+        const universeId = validateWebhookBase(req, res);
+        if (!universeId) return;
+
+        const raw = req.body || {};
+
+        if (WEBHOOK_DEBUG) {
+            // Hanya nama field, tidak mencetak nama donor/pesan/nilai sensitif.
+            console.log("[WEBHOOK SOCIABUZZ FIELDS]", listWebhookFields(raw));
+        }
+
+        const amount = parseAmount(firstWebhookValue(raw, [
+            "amount",
+            "amount_raw",
+            "nominal",
+            "value",
+            "total",
+            "total_amount",
+            "donation_amount",
+            "support_amount",
+            "gross_amount",
+        ]));
+
+        if (!amount || amount <= 0) {
+            return res.json({
+                ok: true,
+                ignored: true,
+                reason: "INVALID_AMOUNT",
+            });
+        }
+
+        const donorName = firstWebhookValue(raw, [
+            "name",
+            "supporter_name",
+            "supporter",
+            "donor_name",
+            "donator_name",
+            "donator",
+            "username",
+            "from_name",
+            "customer_name",
+        ]) || "Anonymous";
+
+        const message = firstWebhookValue(raw, [
+            "message",
+            "supporter_message",
+            "support_message",
+            "note",
+            "comment",
+            "pesan",
+        ]);
+
+        const providerId = firstWebhookValue(raw, [
+            "id",
+            "transaction_id",
+            "transactionId",
+            "order_id",
+            "invoice_id",
+            "payment_id",
+            "reference_id",
+            "ref_id",
+            "uuid",
+        ]);
+
+        const hash = createDonationHash(
+            "sociabuzz",
+            donorName,
+            amount,
+            message,
+            providerId
+        );
+
+        const dedupe = await markDuplicateBestEffort(hash);
+
+        if (dedupe.duplicate) {
+            return res.json({
+                ok: true,
+                duplicate: true,
+            });
+        }
+
+        const timestamp = Date.now();
+
+        const donation = {
+            id: hash,
+            timestamp,
+            source: "sociabuzz",
+            donorName: String(donorName),
+            amount: Number(amount),
+            currency: String(firstWebhookValue(raw, ["currency", "currency_code"]) || "IDR"),
+            message: String(message || ""),
+        };
+
+        const result = await saveAndPublishDonation(universeId, donation);
+
+        res.json({
+            ok: true,
+            donationId: donation.id,
+            pushedToRoblox: result.publishResult.ok === true,
+            publishResult: result.publishResult,
+            savedToRedis: result.saveResult.ok === true,
+            saveResult: result.saveResult,
+            dedupe,
+        });
+    } catch (err) {
+        console.error("[WEBHOOK SOCIABUZZ ERROR]", err);
+        res.status(500).json({
+            ok: false,
+            error: "INTERNAL_ERROR",
+        });
+    }
+});
+
+// ============================================================
 // TEST OPEN CLOUD PUBLISH
 // URL:
 // POST /api/test/publish/:universeId?secret=WEBHOOK_SECRET
@@ -564,6 +729,8 @@ app.get("/", (req, res) => {
         topic: ROBLOX_TOPIC,
         allowedUniverses: ALLOWED_UNIVERSES,
         redisEnabled: Boolean(redis),
+        webhookDebug: WEBHOOK_DEBUG,
+        supportedProviders: ["saweria", "bagibagi", "sociabuzz"],
     });
 });
 
